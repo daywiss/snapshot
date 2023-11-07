@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { clone } from '@snapshot-labs/snapshot.js/src/utils';
-import { getInstance } from '@snapshot-labs/lock/plugins/vue3';
+import { ExtendedSpace } from '@/helpers/interfaces';
 import { PROPOSAL_QUERY } from '@/helpers/queries';
 import { proposalValidation } from '@/helpers/snapshot';
-import { ExtendedSpace } from '@/helpers/interfaces';
 import Plugin from '@/plugins/safeSnap';
+import { getInstance } from '@snapshot-labs/lock/plugins/vue3';
+import { clone } from '@snapshot-labs/snapshot.js/src/utils';
 
 const safeSnapPlugin = new Plugin();
 
@@ -34,6 +34,7 @@ useMeta({
 
 const { notify } = useFlashNotification();
 const router = useRouter();
+const route = useRoute();
 const { t } = useI18n();
 const auth = getInstance();
 const { domain } = useApp();
@@ -66,6 +67,10 @@ const currentStep = ref(Step.CONTENT);
 
 const proposal = computed(() =>
   Object.assign(form.value, { choices: form.value.choices })
+);
+
+const isEditing = computed(
+  () => !!(sourceProposal.value && route.query.editing)
 );
 
 type DateRange = {
@@ -204,9 +209,16 @@ function getFormattedForm() {
 }
 
 const { resetSpaceProposals } = useProposals();
-async function handleSubmit() {
+
+function handleSubmit() {
+  if (!termsAccepted && props.space.terms) return (modalTermsOpen.value = true);
+  if (isEditing.value) return handleUpdate();
+  handleCreate();
+}
+
+async function handleCreate() {
   const formattedForm = getFormattedForm();
-  const result = await send(props.space, 'proposal', formattedForm);
+  const result = await send(props.space, 'create-proposal', formattedForm);
   if (result.id) {
     resetSpaceProposals();
     if (!result.ipfs) notify(['green', t('notify.waitingForOtherSigners')]);
@@ -217,6 +229,25 @@ async function handleSubmit() {
       params: {
         key: props.space.id,
         id: result.id
+      }
+    });
+  }
+}
+
+async function handleUpdate() {
+  const formattedForm = getFormattedForm();
+  formattedForm.id = sourceProposal.value;
+  const result = await send(props.space, 'update-proposal', formattedForm);
+  if (result.id) {
+    resetSpaceProposals();
+    if (!result.ipfs) notify(['green', t('notify.waitingForOtherSigners')]);
+    else notify(['green', t('notify.proposalUpdated')]);
+    resetForm();
+    router.push({
+      name: 'spaceProposal',
+      params: {
+        key: props.space.id,
+        id: sourceProposal.value
       }
     });
   }
@@ -321,9 +352,18 @@ watch(
   { immediate: true }
 );
 
+const hasOsnapPlugin = computed(() => {
+  return !!props.space?.plugins?.oSnap;
+});
+const shouldUseOsnap = ref(false);
+
+function toggleShouldUseOsnap() {
+  shouldUseOsnap.value = !shouldUseOsnap.value;
+}
+
 // We need to know if the space is using osnap, this will change what types of voting we can do
 // We also need to know if the user plans to use osnap
-const osnap = ref<{
+const legacyOsnap = ref<{
   enabled: boolean;
   selection: boolean;
 }>({
@@ -333,15 +373,14 @@ const osnap = ref<{
 
 // Skip transaction page if osnap is enabled, its not selected to be used, and we are on the voting page
 function shouldSkipTransactions() {
-  return (
-    osnap.value.enabled &&
-    !osnap.value.selection &&
-    currentStep.value === Step.VOTING
-  );
+  if (currentStep.value !== Step.VOTING) return false;
+  if (legacyOsnap.value.enabled && !legacyOsnap.value.selection) return true;
+  if (hasOsnapPlugin.value && !shouldUseOsnap.value) return true;
+  return false;
 }
 
-function handleOsnapToggle() {
-  osnap.value.selection = !osnap.value.selection;
+function handleLegacyOsnapToggle() {
+  legacyOsnap.value.selection = !legacyOsnap.value.selection;
 }
 
 onMounted(async () => {
@@ -349,7 +388,7 @@ onMounted(async () => {
   const umaAddress = props?.space?.plugins?.safeSnap?.safes?.[0]?.umaAddress;
   if (network && umaAddress) {
     // this is how we check if osnap is enabled and valid.
-    osnap.value.enabled =
+    legacyOsnap.value.enabled =
       (await safeSnapPlugin.validateUmaModule(network, umaAddress)) === 'uma';
   }
   if (sourceProposal.value && !sourceProposalLoaded.value)
@@ -366,6 +405,12 @@ onMounted(async () => {
     !formDraft.value.isBodySet
   ) {
     form.value.body = props.space.template;
+  }
+});
+
+onBeforeRouteLeave(async () => {
+  if (isEditing.value) {
+    resetForm();
   }
 });
 </script>
@@ -407,8 +452,12 @@ onMounted(async () => {
         :space="space"
         :date-start="dateStart"
         :date-end="dateEnd"
-        :osnap="osnap"
-        @osnapToggle="handleOsnapToggle"
+        :has-osnap-plugin="hasOsnapPlugin"
+        :should-use-osnap="shouldUseOsnap"
+        :legacy-osnap="legacyOsnap"
+        :is-editing="isEditing"
+        @toggle-should-use-osnap="toggleShouldUseOsnap"
+        @legacy-osnap-toggle="handleLegacyOsnapToggle"
       />
 
       <!-- Step 3 (only when plugins) -->
@@ -442,13 +491,9 @@ onMounted(async () => {
           class="block w-full"
           primary
           data-testid="create-proposal-publish-button"
-          @click="
-            !termsAccepted && space.terms
-              ? (modalTermsOpen = true)
-              : handleSubmit()
-          "
+          @click="handleSubmit"
         >
-          {{ $t('create.publish') }}
+          {{ isEditing ? 'Save changes' : $t('create.publish') }}
         </BaseButton>
         <BaseButton
           v-else
